@@ -1,0 +1,10 @@
+echo "backend/node_modules/
+frontend/node_modules/
+node_modules/
+.env
+backend/.env
+frontend/.env
+dist/
+build/
+.DS_Store" > .gitignore
+
