@@ -4,6 +4,7 @@ import path from "path";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import { decode } from "wav-decoder";
+import axios from "axios";
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
@@ -44,7 +45,7 @@ export async function convertToWav(
       .audioChannels(1)
       .audioFrequency(16000)
       .format("wav")
-      .on("error", (err) => reject(err))
+      .on("error", (err: any) => reject(err))
       .on("end", () => resolve(wavPath))
       .save(wavPath);
   });
@@ -70,4 +71,36 @@ export async function transcribeAudio(filePath: string) {
 
   const result = await transcriber(floatArray);
   return result.text;
+}
+
+export async function transcribeWithDeepgram(
+  filePath: string,
+  mimeType?: string
+): Promise<string> {
+  const key = process.env.DEEPGRAM_API_KEY;
+  if (!key) {
+    throw new Error("DEEPGRAM_API_KEY not set");
+  }
+  if (!fs.existsSync(filePath)) {
+    throw new Error("Audio file not found: " + filePath);
+  }
+  const ext = path.extname(filePath).toLowerCase();
+  const inferredMime =
+    mimeType || (ext === ".wav" ? "audio/wav" : ext === ".mp3" ? "audio/mpeg" : "audio/webm");
+
+  const audio = fs.readFileSync(filePath);
+  const url = "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&language=en";
+  const resp = await axios.post(url, audio, {
+    headers: {
+      Authorization: `Token ${key}`,
+      "Content-Type": inferredMime
+    },
+    timeout: 120000
+  });
+  const data = resp.data as any;
+  const transcript = data?.results?.channels?.[0]?.alternatives?.[0]?.transcript;
+  if (!transcript) {
+    throw new Error("Deepgram returned no transcript");
+  }
+  return transcript as string;
 }

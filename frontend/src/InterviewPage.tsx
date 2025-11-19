@@ -9,7 +9,7 @@ import React, {
 import { io, Socket } from "socket.io-client";
 
 const BACKEND_BASE =
-  (import.meta as any)?.env?.VITE_BACKEND_URL || "http://localhost:4000";
+  (import.meta as any).env.VITE_BACKEND_URL || "http://localhost:4000";
 
 type ChatMessage = {
   id: string;
@@ -37,25 +37,40 @@ function formatTime(ts: number) {
   }).format(ts);
 }
 
-const SILENCE_THRESHOLD = 0.015; // normalized amplitude
-const SILENCE_WINDOW_MS = 2000;
+const SILENCE_THRESHOLD = 0.01; // Lowered threshold
+const MIN_SPEECH_DURATION_MS = 250; // User must speak for at least 250ms to be considered "speaking"
+const SILENCE_WINDOW_MS = 3000;
 
 export default function InterviewPage() {
+  const [uiState, setUiState] = useState<"card" | "normal">("card");
   const [consented, setConsented] = useState(false);
   const [camStream, setCamStream] = useState<MediaStream | null>(null);
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
+  const [company, setCompany] = useState("");
+  const [role, setRole] = useState("");
+  const [roleDescription, setRoleDescription] = useState("");
   const [interviewId, setInterviewId] = useState<string | null>(null);
   const [question, setQuestion] = useState<string | null>(null);
   const [status, setStatus] = useState<"idle" | "recording" | "processing">(
     "idle"
   );
+  const displayRole = useMemo(() => {
+    const text = (role || "").trim();
+    if (!text) return "";
+    const firstLine = text.split(/\r?\n/)[0];
+    return firstLine.length > 60 ? firstLine.slice(0, 57) + "..." : firstLine;
+  }, [role]);
+  const displayCompany = useMemo(() => {
+    const text = (company || "").trim();
+    return text.length > 40 ? text.slice(0, 37) + "..." : text;
+  }, [company]);
   const [evaluation, setEvaluation] = useState<any>(null);
   const [sessionLost, setSessionLost] = useState(false);
   const [chatInput, setChatInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: "intro",
-      sender: "Zaim Maulana",
+      sender: "AI Interviewer",
       text: "Hello, welcome back! Ready when you are.",
       role: "interviewer",
       timestamp: Date.now()
@@ -70,6 +85,17 @@ export default function InterviewPage() {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const silenceSinceRef = useRef<number | null>(null);
   const autoStopTriggeredRef = useRef(false);
+  const hasStartedSpeakingRef = useRef(false);
+
+  // Initialize to card view if no details are set
+  useEffect(() => {
+    if (!company && !role) {
+      setUiState("card");
+    } else {
+      setUiState("normal");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -100,7 +126,7 @@ export default function InterviewPage() {
     if (question && question !== lastQuestionRef.current) {
       lastQuestionRef.current = question;
       pushMessage({
-        sender: "Interviewer",
+        sender: "AI Interviewer",
         text: question,
         role: "interviewer"
       });
@@ -158,10 +184,15 @@ export default function InterviewPage() {
   }
 
   async function createInterview() {
+    if (!company || !role) {
+      alert("Please enter a company and role to start the interview.");
+      return;
+    }
     try {
       const r = await fetch(`${BACKEND_BASE}/api/interviews`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" }
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ company, role, roleDescription }),
       });
       if (!r.ok) throw new Error("Failed to create interview");
       const data = await r.json();
@@ -189,17 +220,30 @@ export default function InterviewPage() {
 
     socket.on("question", (payload: { question: string }) => {
       setQuestion(payload.question);
-      speak(payload.question);
+      speak(payload.question, () => {
+        if (interviewId) {
+          startRecording();
+        }
+      });
       setStatus("idle");
     });
 
     socket.on(
       "evaluation",
-      (payload: { evaluation: any; nextQuestion: string | null }) => {
+      (payload: { evaluation: any; nextQuestion: string | null; transcript?: string }) => {
         setEvaluation(payload.evaluation);
+        if (payload?.transcript) {
+          pushMessage({ sender: "You", text: payload.transcript, role: "candidate" });
+        }
         setQuestion(payload.nextQuestion);
         setStatus("idle");
-        if (payload.nextQuestion) speak(payload.nextQuestion);
+        if (payload.nextQuestion) {
+          speak(payload.nextQuestion, () => {
+            if (interviewId) {
+              startRecording();
+            }
+          });
+        }
       }
     );
 
@@ -216,16 +260,55 @@ export default function InterviewPage() {
     });
   }
 
-  function speak(text: string) {
+  function speak(text: string, onEnd?: () => void) {
+    // Try ElevenLabs TTS first
+    fetch(`${BACKEND_BASE}/api/tts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text })
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error("TTS failed");
+        return res.blob();
+      })
+      .then((blob) => {
+        const audio = new Audio(URL.createObjectURL(blob));
+        audio.onended = () => {
+          if (onEnd) onEnd();
+        };
+        audio.onerror = () => {
+          console.warn("Audio playback failed, trying browser TTS");
+          fallbackToSpeechSynthesis(text, onEnd);
+        };
+        audio.play().catch(() => {
+          console.warn("Audio play blocked, trying browser TTS");
+          fallbackToSpeechSynthesis(text, onEnd);
+        });
+      })
+      .catch((err) => {
+        console.warn("ElevenLabs TTS unavailable, using browser TTS:", err?.message);
+        fallbackToSpeechSynthesis(text, onEnd);
+      });
+  }
+
+  function fallbackToSpeechSynthesis(text: string, onEnd?: () => void) {
     try {
       if ("speechSynthesis" in window) {
         const utterance = new SpeechSynthesisUtterance(text);
         utterance.lang = "en-US";
+        if (onEnd) {
+          utterance.onend = onEnd;
+        }
         window.speechSynthesis.cancel();
         window.speechSynthesis.speak(utterance);
+      } else if (onEnd) {
+        onEnd();
       }
     } catch (error) {
       console.warn("Speech synthesis failed:", error);
+      if (onEnd) {
+        onEnd();
+      }
     }
   }
 
@@ -283,6 +366,7 @@ export default function InterviewPage() {
 
     mediaRecorderRef.current = recorder;
     autoStopTriggeredRef.current = false;
+    hasStartedSpeakingRef.current = false;
     silenceSinceRef.current = null;
 
     try {
@@ -298,13 +382,18 @@ export default function InterviewPage() {
     if (!mediaRecorderRef.current) return;
 
     try {
+      // Request final data flush, then stop
+      try { (mediaRecorderRef.current as any).requestData?.(); } catch {}
       mediaRecorderRef.current.stop();
     } catch (error) {
       console.warn("Error stopping recorder:", error);
     }
 
     setStatus("processing");
-    socketRef.current?.emit("end-answer");
+    // Slight delay to ensure the last dataavailable reaches the server
+    setTimeout(() => {
+      socketRef.current?.emit("end-answer");
+    }, 350);
   }
 
   useEffect(() => {
@@ -322,7 +411,14 @@ export default function InterviewPage() {
       }
       const rms = Math.sqrt(sumSquares / dataArray.length) / 128;
       const now = Date.now();
-      if (rms < SILENCE_THRESHOLD) {
+      
+      if (rms >= SILENCE_THRESHOLD) {
+        // User is speaking
+        hasStartedSpeakingRef.current = true;
+        silenceSinceRef.current = null;
+        autoStopTriggeredRef.current = false;
+      } else if (hasStartedSpeakingRef.current) {
+        // User has spoken before and is now silent
         if (!silenceSinceRef.current) {
           silenceSinceRef.current = now;
         } else if (
@@ -333,9 +429,6 @@ export default function InterviewPage() {
           autoStopTriggeredRef.current = true;
           stopRecordingAndSubmit();
         }
-      } else {
-        silenceSinceRef.current = null;
-        autoStopTriggeredRef.current = false;
       }
       rafId = requestAnimationFrame(tick);
     };
@@ -405,6 +498,65 @@ export default function InterviewPage() {
     setChatInput("");
   }
 
+  function handleSaveAndNext() {
+    if (!company || !role) return;
+    setUiState("normal");
+  }
+
+  if (uiState === "card") {
+    return (
+      <div className="card-view">
+        <div className="card-backdrop">
+          <div className="details-card">
+            <h1 className="card-title">Interview Setup</h1>
+            <p className="card-subtitle">
+              Configure your interview details to get started.
+            </p>
+            
+            <div className="card-input-group">
+              <label>Company</label>
+              <input
+                type="text"
+                placeholder="Google, Apple, Microsoft..."
+                value={company}
+                onChange={(e) => setCompany(e.target.value)}
+              />
+            </div>
+            
+            <div className="card-input-group">
+              <label>Role</label>
+              <input
+                type="text"
+                placeholder="Software Engineer, Product Manager..."
+                value={role}
+                onChange={(e) => setRole(e.target.value)}
+              />
+            </div>
+            
+            <div className="card-input-group">
+              <label>Role Details</label>
+              <textarea
+                placeholder="Key responsibilities, required skills, job description..."
+                value={roleDescription}
+                onChange={(e) => setRoleDescription(e.target.value)}
+                rows={4}
+              />
+            </div>
+            
+            <button
+              className="card-save-btn"
+              onClick={handleSaveAndNext}
+              disabled={!company || !role}
+            >
+              Save & Next
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -425,13 +577,13 @@ export default function InterviewPage() {
         <div className="sidebar-bottom">
           <div className="sidebar-profile">
             <img
-              src="https://i.pravatar.cc/100?img=32"
+              src="https://img.stablecog.com/insecure/1920w/aHR0cHM6Ly9iLnN0YWJsZWNvZy5jb20vNGFiZjY0ODQtOWY3Zi00NTIyLWFjOGQtZmZkOTNmNWU3ZmRjLmpwZWc.webp"
               alt="profile avatar"
               draggable={false}
             />
             <div>
-              <div style={{ fontWeight: 600 }}>Zaim Maulana</div>
-              <div style={{ opacity: 0.7, fontSize: "0.85rem" }}>Interviewer</div>
+              <div style={{ fontWeight: 600 }}>You</div>
+              <div style={{ opacity: 0.7, fontSize: "0.85rem" }}>Candidate</div>
             </div>
           </div>
           <button className="secondary-btn">Log Out</button>
@@ -440,9 +592,14 @@ export default function InterviewPage() {
 
       <main className="content-area">
         <header className="content-header">
-          <div>
-            <p style={{ margin: 0, color: "#7d7f95" }}>Interview for</p>
-            <h2 style={{ margin: 0 }}>UI/UX Designer</h2>
+          <div className="header-info">
+            <p className="subtitle-ellipsis" style={{ margin: 0, color: "#7d7f95" }}>
+              Interview for{" "}
+              {displayRole && displayCompany ? `${displayRole} at ${displayCompany}` : "a new role"}
+            </p>
+            <h2 className="title-ellipsis" style={{ margin: 0 }}>
+              {displayRole || "UI/UX Designer"}
+            </h2>
           </div>
           <div className="action-row">
             {sessionLost && (
