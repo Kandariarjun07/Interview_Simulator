@@ -599,6 +599,30 @@ io.of("/interview").on("connection", (socket: Socket) => {
       evalJson = buildMockEvaluation(transcript);
     }
 
+    // CHECK FOR INTERVIEW COMPLETION
+    if (session.turnIndex >= session.maxTurns) {
+      console.log("🏁 Interview complete for session:", sid);
+      
+      // Calculate average score
+      // In a real app, we'd store all scores in session.evaluations array
+      // For now, we'll just use the last score or a mock average
+      const avgScore = evalJson?.score || 3; 
+
+      io.of("/interview").to(sid).emit("evaluation", {
+        evaluation: evalJson,
+        nextQuestion: null, // No next question
+        transcript
+      });
+
+      io.of("/interview").to(sid).emit("interview-ended", {
+        summary: session.summarySoFar,
+        averageScore: avgScore
+      });
+      
+      // Clean up or mark session as done
+      return;
+    }
+
     // Generate next interviewer question strictly from controller state
     let nextQuestion = await getNextQuestionFromLLM(session);
     if (!nextQuestion) {

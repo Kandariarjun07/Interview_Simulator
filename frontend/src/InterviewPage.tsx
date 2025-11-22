@@ -1,23 +1,14 @@
 import React, {
-  ChangeEvent,
-  FormEvent,
   useEffect,
   useMemo,
   useRef,
   useState
 } from "react";
 import { io, Socket } from "socket.io-client";
+import Chat, { ChatMessage } from "./Chat";
 
 const BACKEND_BASE =
   (import.meta as any).env.VITE_BACKEND_URL || "http://localhost:4000";
-
-type ChatMessage = {
-  id: string;
-  sender: string;
-  text: string;
-  role: "interviewer" | "candidate" | "system";
-  timestamp: number;
-};
 
 const navItems = [
   "Main Menu",
@@ -37,12 +28,13 @@ function formatTime(ts: number) {
   }).format(ts);
 }
 
-const SILENCE_THRESHOLD = 0.01; // Lowered threshold
-const MIN_SPEECH_DURATION_MS = 250; // User must speak for at least 250ms to be considered "speaking"
+const SILENCE_THRESHOLD = 0.01;
+const MIN_SPEECH_DURATION_MS = 250;
 const SILENCE_WINDOW_MS = 3000;
 
 export default function InterviewPage() {
   const [uiState, setUiState] = useState<"card" | "normal">("card");
+  const [setupStep, setSetupStep] = useState(0); // 0: details, 1: permissions
   const [consented, setConsented] = useState(false);
   const [camStream, setCamStream] = useState<MediaStream | null>(null);
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
@@ -54,6 +46,8 @@ export default function InterviewPage() {
   const [status, setStatus] = useState<"idle" | "recording" | "processing">(
     "idle"
   );
+  const [isInterviewComplete, setIsInterviewComplete] = useState(false);
+
   const displayRole = useMemo(() => {
     const text = (role || "").trim();
     if (!text) return "";
@@ -66,7 +60,7 @@ export default function InterviewPage() {
   }, [company]);
   const [evaluation, setEvaluation] = useState<any>(null);
   const [sessionLost, setSessionLost] = useState(false);
-  const [chatInput, setChatInput] = useState("");
+  
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: "intro",
@@ -91,6 +85,10 @@ export default function InterviewPage() {
   useEffect(() => {
     if (!company && !role) {
       setUiState("card");
+      setSetupStep(0);
+    } else if (!consented) {
+      setUiState("card");
+      setSetupStep(1);
     } else {
       setUiState("normal");
     }
@@ -136,6 +134,10 @@ export default function InterviewPage() {
   useEffect(() => {
     if (evaluation?.feedback && evaluation.feedback !== lastFeedbackRef.current) {
       lastFeedbackRef.current = evaluation.feedback;
+      // Only show feedback in chat if interview is NOT complete, or if you want it there.
+      // User asked for score AFTER interview, but feedback might still be useful during?
+      // "the ai score should come after the interview is over."
+      // I'll keep feedback in chat for now as it's conversational.
       pushMessage({
         sender: "AI Coach",
         text: evaluation.feedback,
@@ -182,7 +184,6 @@ export default function InterviewPage() {
       setConsented(false);
     }
   }
-
   async function createInterview() {
     if (!company || !role) {
       alert("Please enter a company and role to start the interview.");
@@ -200,6 +201,7 @@ export default function InterviewPage() {
       setInterviewId(data.id);
       setQuestion(data.question);
       setSessionLost(false);
+      setIsInterviewComplete(false);
       connectSocket(data.id);
     } catch (error) {
       console.error("Interview creation failed:", error);
@@ -235,17 +237,38 @@ export default function InterviewPage() {
         if (payload?.transcript) {
           pushMessage({ sender: "You", text: payload.transcript, role: "candidate" });
         }
-        setQuestion(payload.nextQuestion);
-        setStatus("idle");
+        
         if (payload.nextQuestion) {
+          setQuestion(payload.nextQuestion);
+          setStatus("idle");
           speak(payload.nextQuestion, () => {
             if (interviewId) {
               startRecording();
             }
           });
+        } else {
+            // No next question? Might be waiting for interview-ended or just a pause.
+            setStatus("idle");
         }
       }
     );
+
+    socket.on("interview-ended", (payload: { summary: string; averageScore: number }) => {
+        setIsInterviewComplete(true);
+        setStatus("idle");
+        setQuestion("Interview Complete. Thank you!");
+        pushMessage({
+            sender: "System",
+            text: "Interview finished. Check your scores.",
+            role: "system"
+        });
+        // You might want to update evaluation with the final average score if needed
+        // or just use the last evaluation. 
+        // For now, I'll assume the last evaluation is fine or I can use payload.averageScore
+        if (payload.averageScore) {
+            setEvaluation((prev: any) => ({ ...prev, score: payload.averageScore }));
+        }
+    });
 
     socket.on("session-missing", () => {
       setSessionLost(true);
@@ -483,73 +506,149 @@ export default function InterviewPage() {
     }
   }
 
-  function handleChatInput(event: ChangeEvent<HTMLInputElement>) {
-    setChatInput(event.target.value);
-  }
-
-  function handleSendChat(event: FormEvent) {
-    event.preventDefault();
-    if (!chatInput.trim()) return;
+  function handleSendMessage(text: string) {
     pushMessage({
       sender: "You",
-      text: chatInput.trim(),
+      text: text,
       role: "candidate"
     });
-    setChatInput("");
   }
 
   function handleSaveAndNext() {
     if (!company || !role) return;
-    setUiState("normal");
+    setSetupStep(1); // Move to permissions step
   }
 
   if (uiState === "card") {
     return (
-      <div className="card-view">
-        <div className="card-backdrop">
-          <div className="details-card">
-            <h1 className="card-title">Interview Setup</h1>
-            <p className="card-subtitle">
-              Configure your interview details to get started.
-            </p>
-            
-            <div className="card-input-group">
-              <label>Company</label>
-              <input
-                type="text"
-                placeholder="Google, Apple, Microsoft..."
-                value={company}
-                onChange={(e) => setCompany(e.target.value)}
-              />
+      <div className="setup-wizard">
+        <div className="setup-container">
+          {/* Timeline Stepper */}
+          <div className="timeline-stepper">
+            <div className={`timeline-step ${setupStep === 0 ? 'active' : setupStep > 0 ? 'completed' : ''}`}>
+              <div className="step-circle">
+                {setupStep > 0 ? '' : '1'}
+              </div>
+              <div className="step-label">Interview Details</div>
+              <div className="step-line"></div>
             </div>
-            
-            <div className="card-input-group">
-              <label>Role</label>
-              <input
-                type="text"
-                placeholder="Software Engineer, Product Manager..."
-                value={role}
-                onChange={(e) => setRole(e.target.value)}
-              />
+            <div className={`timeline-step ${setupStep === 1 ? 'active' : setupStep > 1 ? 'completed' : ''}`}>
+              <div className="step-circle">
+                {setupStep > 1 ? '' : '2'}
+              </div>
+              <div className="step-label">Permissions</div>
             </div>
-            
-            <div className="card-input-group">
-              <label>Role Details</label>
-              <textarea
-                placeholder="Key responsibilities, required skills, job description..."
-                value={roleDescription}
-                onChange={(e) => setRoleDescription(e.target.value)}
-                rows={4}
-              />
+          </div>
+
+          {/* Wizard Cards */}
+          <div className="wizard-cards">
+            {/* Step 0: Details Card */}
+            <div className={`wizard-card ${
+              setupStep === 0 ? 'active' : setupStep > 0 ? 'prev' : 'next'
+            }`}>
+              <h1 className="wizard-title">Interview Setup</h1>
+              <p className="wizard-subtitle">
+                Configure your interview details to get started.
+              </p>
+              
+              <form className="wizard-form">
+                <div className="form-group">
+                  <label>Company</label>
+                  <input
+                    type="text"
+                    placeholder="Google, Apple, Microsoft..."
+                    value={company}
+                    onChange={(e) => setCompany(e.target.value)}
+                  />
+                </div>
+                
+                <div className="form-group">
+                  <label>Role</label>
+                  <input
+                    type="text"
+                    placeholder="Software Engineer, Product Manager..."
+                    value={role}
+                    onChange={(e) => setRole(e.target.value)}
+                  />
+                </div>
+                
+                <div className="form-group">
+                  <label>Role Details</label>
+                  <textarea
+                    placeholder="Key responsibilities, required skills, job description..."
+                    value={roleDescription}
+                    onChange={(e) => setRoleDescription(e.target.value)}
+                    rows={3}
+                  />
+                </div>
+
+                <div className="wizard-actions">
+                  <button
+                    type="button"
+                    className="wizard-btn wizard-btn-primary"
+                    onClick={handleSaveAndNext}
+                    disabled={!company || !role}
+                  >
+                    Next
+                  </button>
+                </div>
+              </form>
             </div>
-            
-            <button
-              className="card-save-btn"
-              onClick={handleSaveAndNext}
-              disabled={!company || !role}
-            >
-              Save & Next
-            </button>
+
+            {/* Step 1: Permissions Card */}
+            <div className={`wizard-card ${
+              setupStep === 1 ? 'active' : setupStep < 1 ? 'next' : 'prev'
+            }`}>
+              <div className="permission-icon">🎥</div>
+              <h1 className="wizard-title">Camera & Mic Access</h1>
+              <p className="wizard-subtitle">
+                We need access to your camera and microphone for the interview.
+              </p>
+
+              <div className="permission-list">
+                <div className="permission-item">
+                  <span className="permission-item-icon">📹</span>
+                  <div className="permission-item-text">
+                    <strong>Camera Access</strong>
+                    <p style={{ fontSize: '0.875rem', margin: 0, opacity: 0.7 }}>
+                      To see you during the interview
+                    </p>
+                  </div>
+                  <div className={`permission-status ${camStream ? 'granted' : ''}`}>
+                    {camStream && '✓'}
+                  </div>
+                </div>
+                <div className="permission-item">
+                  <span className="permission-item-icon">🎤</span>
+                  <div className="permission-item-text">
+                    <strong>Microphone Access</strong>
+                    <p style={{ fontSize: '0.875rem', margin: 0, opacity: 0.7 }}>
+                      To hear your responses
+                    </p>
+                  </div>
+                  <div className={`permission-status ${micStream ? 'granted' : ''}`}>
+                    {micStream && '✓'}
+                  </div>
+                </div>
+              </div>
+
+              <div className="wizard-actions">
+                <button
+                  type="button"
+                  className="wizard-btn wizard-btn-secondary"
+                  onClick={() => setSetupStep(0)}
+                >
+                  Back
+                </button>
+                <button
+                  type="button"
+                  className="wizard-btn wizard-btn-primary"
+                  onClick={consented ? () => setUiState("normal") : handleConsent}
+                >
+                  {consented ? 'Proceed' : 'Grant Access'}
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -681,74 +780,45 @@ export default function InterviewPage() {
               </p>
             </div>
 
-            <div className="score-card">
-              <div className="score-header">
-                <h3 style={{ margin: 0 }}>AI Video Score</h3>
-                <span style={{ color: "#7a7c92" }}>Latest breakdown</span>
-              </div>
-
-              <div className="meter-group">
-                <div className="meter">
-                  <h5>AI Score</h5>
-                  <strong>{displayScore}%</strong>
+            {isInterviewComplete && (
+              <div className="score-card">
+                <div className="score-header">
+                  <h3 style={{ margin: 0 }}>AI Video Score</h3>
+                  <span style={{ color: "#7a7c92" }}>Final Result</span>
                 </div>
-                <div className="meter">
-                  <h5>Workmap Score</h5>
-                  <strong>
-                    {evaluation?.workmap ?? Math.min(100, displayScore + 12)}%
-                  </strong>
-                </div>
-              </div>
 
-              <div className="workmap-list">
-                {workmapScores.map((item) => (
-                  <div className="workmap-item" key={item.label}>
-                    <span>{item.label}</span>
-                    <div className="workmap-bar">
-                      <div
-                        className="workmap-bar-fill"
-                        style={{ width: `${item.value}%` }}
-                      />
-                    </div>
-                    <strong>{item.value}%</strong>
+                <div className="meter-group">
+                  <div className="meter">
+                    <h5>AI Score</h5>
+                    <strong>{displayScore}%</strong>
                   </div>
-                ))}
+                  <div className="meter">
+                    <h5>Workmap Score</h5>
+                    <strong>
+                      {evaluation?.workmap ?? Math.min(100, displayScore + 12)}%
+                    </strong>
+                  </div>
+                </div>
+
+                <div className="workmap-list">
+                  {workmapScores.map((item) => (
+                    <div className="workmap-item" key={item.label}>
+                      <span>{item.label}</span>
+                      <div className="workmap-bar">
+                        <div
+                          className="workmap-bar-fill"
+                          style={{ width: `${item.value}%` }}
+                        />
+                      </div>
+                      <strong>{item.value}%</strong>
+                    </div>
+                  ))}
+                </div>
               </div>
-            </div>
+            )}
           </section>
 
-          <aside className="card chat-card">
-            <div className="chat-tabs">
-              <button className="active">Chat</button>
-              <button type="button">Participant</button>
-            </div>
-            <div className="chat-messages">
-              {messages.map((msg) => {
-                const bubbleClass =
-                  msg.role === "candidate"
-                    ? "chat-bubble outgoing"
-                    : msg.role === "system"
-                    ? "chat-bubble system"
-                    : "chat-bubble incoming";
-                return (
-                  <div key={msg.id}>
-                    <small style={{ color: "#9a9cc2" }}>
-                      {msg.sender} • {formatTime(msg.timestamp)}
-                    </small>
-                    <div className={bubbleClass}>{msg.text}</div>
-                  </div>
-                );
-              })}
-            </div>
-            <form className="chat-input" onSubmit={handleSendChat}>
-              <input
-                placeholder="Send your message..."
-                value={chatInput}
-                onChange={handleChatInput}
-              />
-              <button type="submit">Send</button>
-            </form>
-          </aside>
+          <Chat messages={messages} onSendMessage={handleSendMessage} />
         </div>
       </main>
     </div>
